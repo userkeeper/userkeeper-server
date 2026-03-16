@@ -5,6 +5,15 @@ const { getFirestore } = require('firebase-admin/firestore');
 const app = express();
 app.use(express.json());
 
+// CORS
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 const firebaseConfig = {
   projectId: 'userkeeper-727e1',
   clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
@@ -68,14 +77,13 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Send SOS to contacts and radius
+// Send SOS to contacts
 app.post('/send-sos', async (req, res) => {
   try {
     const { senderTgId, senderName, sosType, sosLabel, lat, lng, contacts, medInfo } = req.body;
     let sent = 0;
 
     for (const contact of (contacts || [])) {
-      // Try to find by tgId first, then by username
       let contactDoc = null;
 
       if (contact.tgId) {
@@ -126,7 +134,7 @@ app.post('/send-sos-radius', async (req, res) => {
     const promises = snap.docs.map(async doc => {
       const u = doc.data();
       if (!u.location || !u.chatId) return;
-      if (u.tgId === senderTgId) return; // Don't send to self
+      if (u.tgId === senderTgId) return;
 
       const dist = getDistance(lat, lng, u.location.latitude, u.location.longitude);
       if (dist > R) return;
