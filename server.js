@@ -33,7 +33,7 @@ async function sendMessage(chatId, text) {
   });
 }
 
-// Webhook from Telegram
+// ── WEBHOOK ──────────────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   try {
     const { message } = req.body;
@@ -44,21 +44,47 @@ app.post('/webhook', async (req, res) => {
     const username = message.from.username || null;
     const firstName = message.from.first_name || '';
     const lastName = message.from.last_name || '';
+    const text = message.text || '';
 
-    if (message.text === '/start') {
+    if (text === '/start') {
       await db.collection('users').doc(userId).set({
-        tgId: userId,
-        tgUsername: username,
-        chatId,
-        name: firstName,
-        last: lastName,
-        botStarted: true,
-        startedAt: new Date()
+        tgId: userId, tgUsername: username, chatId,
+        name: firstName, last: lastName,
+        botStarted: true, startedAt: new Date()
       }, { merge: true });
 
       await sendMessage(chatId,
         `👋 Привет, ${firstName}!\n\nДобро пожаловать в UserKeeper 🛰\n\nТеперь ты будешь получать SOS сигналы от своих контактов.\n\nОткрой приложение через кнопку меню ниже 👇`
       );
+    }
+
+    // Admin verification commands
+    if (username === 'userkeeper') {
+      if (text.startsWith('/verify_')) {
+        const userId2 = text.replace('/verify_', '').trim();
+        await db.collection('users').doc(userId2).set({ verificationStatus: 'verified' }, { merge: true });
+        await db.collection('verifications').doc(userId2).set({ verificationStatus: 'verified', verifiedAt: new Date() }, { merge: true });
+        const userDoc = await db.collection('users').doc(userId2).get();
+        if (userDoc.exists && userDoc.data().chatId) {
+          await sendMessage(userDoc.data().chatId,
+            `✅ Верификация пройдена!\n\nТвой статус подтверждён. Значок ✅ появится в приложении.\n\nСпасибо что помогаешь людям! 🙏`
+          );
+        }
+        await sendMessage(chatId, `✅ Пользователь ${userId2} верифицирован`);
+      }
+
+      if (text.startsWith('/reject_')) {
+        const userId2 = text.replace('/reject_', '').trim();
+        await db.collection('users').doc(userId2).set({ verificationStatus: 'rejected' }, { merge: true });
+        await db.collection('verifications').doc(userId2).set({ verificationStatus: 'rejected', rejectedAt: new Date() }, { merge: true });
+        const userDoc = await db.collection('users').doc(userId2).get();
+        if (userDoc.exists && userDoc.data().chatId) {
+          await sendMessage(userDoc.data().chatId,
+            `❌ Верификация отклонена\n\nК сожалению, документ не прошёл проверку. Если это ошибка — напиши @userkeeper`
+          );
+        }
+        await sendMessage(chatId, `❌ Пользователь ${userId2} отклонён`);
+      }
     }
 
     if (message.location) {
@@ -77,7 +103,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Send SOS to contacts
+// ── SOS ───────────────────────────────────────────────────────────────────────
 app.post('/send-sos', async (req, res) => {
   try {
     const { senderTgId, senderName, sosType, sosLabel, lat, lng, contacts, medInfo, sosId } = req.body;
@@ -85,18 +111,14 @@ app.post('/send-sos', async (req, res) => {
 
     for (const contact of (contacts || [])) {
       let contactDoc = null;
-
       if (contact.tgId) {
         const snap = await db.collection('users').doc(contact.tgId).get();
         if (snap.exists) contactDoc = snap.data();
       }
-
       if (!contactDoc && contact.username) {
-        const username = contact.username.replace('@', '');
-        const snap = await db.collection('users').where('tgUsername', '==', username).limit(1).get();
+        const snap = await db.collection('users').where('tgUsername', '==', contact.username.replace('@', '')).limit(1).get();
         if (!snap.empty) contactDoc = snap.docs[0].data();
       }
-
       if (!contactDoc || !contactDoc.chatId) continue;
 
       let msg = `🆘 ${sosLabel}\n\n`;
@@ -104,18 +126,15 @@ app.post('/send-sos', async (req, res) => {
       msg += `📍 ${lat.toFixed(5)}, ${lng.toFixed(5)}\n`;
       msg += `🗺 https://maps.google.com/?q=${lat},${lng}`;
       if (sosId) msg += `\n\n💬 Чат: откройте приложение UserKeeper`;
-
       if (sosType === 'red' && medInfo) {
         if (medInfo.blood) msg += `\n\n🩸 Кровь: ${medInfo.blood}`;
         if (medInfo.allergies) msg += `\n⚠️ Аллергии: ${medInfo.allergies}`;
         if (medInfo.conditions) msg += `\n🏥 Заболевания: ${medInfo.conditions}`;
         if (medInfo.meds) msg += `\n💊 Лекарства: ${medInfo.meds}`;
       }
-
       await sendMessage(contactDoc.chatId, msg);
       sent++;
     }
-
     res.json({ success: true, sent });
   } catch(e) {
     console.error('SOS error:', e);
@@ -123,28 +142,22 @@ app.post('/send-sos', async (req, res) => {
   }
 });
 
-// Send SOS to users in radius
 app.post('/send-sos-radius', async (req, res) => {
   try {
-    const { lat, lng, radius, sosLabel, sosType, senderName, senderTgId, medInfo } = req.body;
+    const { lat, lng, radius, sosLabel, senderName, senderTgId } = req.body;
     const R = radius || 1000;
-
     const snap = await db.collection('users').where('isOnline', '==', true).get();
     let sent = 0;
 
     const promises = snap.docs.map(async doc => {
       const u = doc.data();
-      if (!u.location || !u.chatId) return;
-      if (u.tgId === senderTgId) return;
-
+      if (!u.location || !u.chatId || u.tgId === senderTgId) return;
       const dist = getDistance(lat, lng, u.location.latitude, u.location.longitude);
       if (dist > R) return;
-
       let msg = `🆘 ${sosLabel} — РЯДОМ С ВАМИ!\n\n`;
       msg += `📍 ~${Math.round(dist)}м от вас\n`;
       msg += `👤 ${senderName}\n`;
       msg += `🗺 https://maps.google.com/?q=${lat},${lng}`;
-
       await sendMessage(u.chatId, msg);
       sent++;
     });
@@ -165,109 +178,95 @@ function getDistance(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 
-// ── PARENTAL CONTROL ────────────────────────────────────────────────────────
+// ── VERIFICATION ──────────────────────────────────────────────────────────────
+app.post('/request-verification', async (req, res) => {
+  try {
+    const { tgId, tgUsername, name, status, photo } = req.body;
+    if (!tgId || !status || !photo) return res.json({ success: false, error: 'Missing fields' });
 
-// Link parent ↔ child
+    const statusLabels = { med: '🏥 Мед. работник', police: '👮 Полиция / силовые', rescue: '🚒 МЧС / спасатель' };
+
+    await db.collection('verifications').doc(tgId).set({
+      tgId, tgUsername: tgUsername || null, name, status, photo,
+      requestedAt: new Date(), verificationStatus: 'pending'
+    });
+
+    await db.collection('users').doc(tgId).set({ verificationStatus: 'pending' }, { merge: true });
+
+    // Notify admin
+    const adminSnap = await db.collection('users').where('tgUsername', '==', 'userkeeper').limit(1).get();
+    if (!adminSnap.empty) {
+      const adminData = adminSnap.docs[0].data();
+      if (adminData.chatId) {
+        const label = statusLabels[status] || status;
+        const msg = `🪪 Запрос верификации\n\n👤 ${name}\n@${tgUsername || '—'}\n${label}\n\nID: ${tgId}\n\nВерифицировать: /verify_${tgId}\nОтклонить: /reject_${tgId}`;
+        await sendMessage(adminData.chatId, msg);
+      }
+    }
+
+    res.json({ success: true });
+  } catch(e) {
+    console.error('Verification error:', e);
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// ── PARENTAL CONTROL ──────────────────────────────────────────────────────────
 app.post('/add-child', async (req, res) => {
   try {
     const { parentTgId, childUsername } = req.body;
     if (!parentTgId || !childUsername) return res.json({ success: false, error: 'Missing fields' });
-
     const username = childUsername.replace('@', '').toLowerCase();
     const snap = await db.collection('users').where('tgUsername', '==', username).limit(1).get();
     if (snap.empty) return res.json({ success: false, error: 'User not found in UserKeeper' });
-
     const childData = snap.docs[0].data();
     const childTgId = childData.tgId;
-
     const admin = require('firebase-admin');
-    await db.collection('users').doc(parentTgId).set({
-      childrenIds: admin.firestore.FieldValue.arrayUnion(childTgId),
-      isParent: true
-    }, { merge: true });
-
-    await db.collection('users').doc(childTgId).set({
-      parentId: parentTgId,
-      isChild: true
-    }, { merge: true });
-
+    await db.collection('users').doc(parentTgId).set({ childrenIds: admin.firestore.FieldValue.arrayUnion(childTgId), isParent: true }, { merge: true });
+    await db.collection('users').doc(childTgId).set({ parentId: parentTgId, isChild: true }, { merge: true });
     if (childData.chatId) {
-      await sendMessage(childData.chatId,
-        `👨‍👩‍👧 Вас добавили как ребёнка в UserKeeper.\n\nРодитель может видеть вашу геолокацию когда Telegram активен.\n\nЕсли это ошибка — напишите @userkeeper`
-      );
+      await sendMessage(childData.chatId, `👨‍👩‍👧 Вас добавили как ребёнка в UserKeeper.\n\nРодитель может видеть вашу геолокацию когда Telegram активен.\n\nЕсли это ошибка — напишите @userkeeper`);
     }
-
     res.json({ success: true, childName: childData.name || username, childTgId });
-  } catch(e) {
-    console.error('add-child error:', e);
-    res.json({ success: false, error: e.message });
-  }
+  } catch(e) { console.error('add-child error:', e); res.json({ success: false, error: e.message }); }
 });
 
-// Get child's last known location
 app.post('/get-child-location', async (req, res) => {
   try {
     const { parentTgId, childTgId } = req.body;
     if (!parentTgId || !childTgId) return res.json({ success: false, error: 'Missing fields' });
-
     const parentDoc = await db.collection('users').doc(parentTgId).get();
     if (!parentDoc.exists) return res.json({ success: false, error: 'Parent not found' });
     const parentData = parentDoc.data();
-    if (!parentData.childrenIds || !parentData.childrenIds.includes(childTgId)) {
-      return res.json({ success: false, error: 'Not authorized' });
-    }
-
+    if (!parentData.childrenIds || !parentData.childrenIds.includes(childTgId)) return res.json({ success: false, error: 'Not authorized' });
     const childDoc = await db.collection('users').doc(childTgId).get();
     if (!childDoc.exists) return res.json({ success: false, error: 'Child not found' });
     const d = childDoc.data();
-
-    res.json({
-      success: true,
-      name: d.name || 'Ребёнок',
-      location: d.location || null,
-      locationUpdatedAt: d.locationUpdatedAt || null,
-      isOnline: d.isOnline || false
-    });
-  } catch(e) {
-    console.error('get-child-location error:', e);
-    res.json({ success: false, error: e.message });
-  }
+    res.json({ success: true, name: d.name || 'Ребёнок', location: d.location || null, locationUpdatedAt: d.locationUpdatedAt || null, isOnline: d.isOnline || false });
+  } catch(e) { console.error('get-child-location error:', e); res.json({ success: false, error: e.message }); }
 });
 
-// Get all children for a parent
 app.post('/get-children', async (req, res) => {
   try {
     const { parentTgId } = req.body;
     if (!parentTgId) return res.json({ success: false, error: 'Missing parentTgId' });
-
     const parentDoc = await db.collection('users').doc(parentTgId).get();
     if (!parentDoc.exists) return res.json({ success: true, children: [] });
     const parentData = parentDoc.data();
     const childrenIds = parentData.childrenIds || [];
     if (!childrenIds.length) return res.json({ success: true, children: [] });
-
     const children = [];
     for (const childId of childrenIds) {
       const childDoc = await db.collection('users').doc(childId).get();
       if (!childDoc.exists) continue;
       const d = childDoc.data();
-      children.push({
-        tgId: childId,
-        name: d.name || 'Ребёнок',
-        tgUsername: d.tgUsername || null,
-        location: d.location || null,
-        locationUpdatedAt: d.locationUpdatedAt || null,
-        isOnline: d.isOnline || false
-      });
+      children.push({ tgId: childId, name: d.name || 'Ребёнок', tgUsername: d.tgUsername || null, location: d.location || null, locationUpdatedAt: d.locationUpdatedAt || null, isOnline: d.isOnline || false });
     }
-
     res.json({ success: true, children });
-  } catch(e) {
-    console.error('get-children error:', e);
-    res.json({ success: false, error: e.message });
-  }
+  } catch(e) { console.error('get-children error:', e); res.json({ success: false, error: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'UserKeeper server running ✅' }));
 
 const PORT = process.env.PORT || 3000;
