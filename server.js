@@ -80,7 +80,7 @@ app.post('/webhook', async (req, res) => {
 // Send SOS to contacts
 app.post('/send-sos', async (req, res) => {
   try {
-    const { senderTgId, senderName, sosType, sosLabel, lat, lng, contacts, medInfo } = req.body;
+    const { senderTgId, senderName, sosType, sosLabel, lat, lng, contacts, medInfo, sosId } = req.body;
     let sent = 0;
 
     for (const contact of (contacts || [])) {
@@ -103,6 +103,7 @@ app.post('/send-sos', async (req, res) => {
       msg += `👤 ${senderName} нуждается в помощи!\n`;
       msg += `📍 ${lat.toFixed(5)}, ${lng.toFixed(5)}\n`;
       msg += `🗺 https://maps.google.com/?q=${lat},${lng}`;
+      if (sosId) msg += `\n\n💬 Чат: откройте приложение UserKeeper`;
 
       if (sosType === 'red' && medInfo) {
         if (medInfo.blood) msg += `\n\n🩸 Кровь: ${medInfo.blood}`;
@@ -163,6 +164,109 @@ function getDistance(lat1, lng1, lat2, lng2) {
   const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
+
+// ── PARENTAL CONTROL ────────────────────────────────────────────────────────
+
+// Link parent ↔ child
+app.post('/add-child', async (req, res) => {
+  try {
+    const { parentTgId, childUsername } = req.body;
+    if (!parentTgId || !childUsername) return res.json({ success: false, error: 'Missing fields' });
+
+    const username = childUsername.replace('@', '').toLowerCase();
+    const snap = await db.collection('users').where('tgUsername', '==', username).limit(1).get();
+    if (snap.empty) return res.json({ success: false, error: 'User not found in UserKeeper' });
+
+    const childData = snap.docs[0].data();
+    const childTgId = childData.tgId;
+
+    const admin = require('firebase-admin');
+    await db.collection('users').doc(parentTgId).set({
+      childrenIds: admin.firestore.FieldValue.arrayUnion(childTgId),
+      isParent: true
+    }, { merge: true });
+
+    await db.collection('users').doc(childTgId).set({
+      parentId: parentTgId,
+      isChild: true
+    }, { merge: true });
+
+    if (childData.chatId) {
+      await sendMessage(childData.chatId,
+        `👨‍👩‍👧 Вас добавили как ребёнка в UserKeeper.\n\nРодитель может видеть вашу геолокацию когда Telegram активен.\n\nЕсли это ошибка — напишите @userkeeper`
+      );
+    }
+
+    res.json({ success: true, childName: childData.name || username, childTgId });
+  } catch(e) {
+    console.error('add-child error:', e);
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// Get child's last known location
+app.post('/get-child-location', async (req, res) => {
+  try {
+    const { parentTgId, childTgId } = req.body;
+    if (!parentTgId || !childTgId) return res.json({ success: false, error: 'Missing fields' });
+
+    const parentDoc = await db.collection('users').doc(parentTgId).get();
+    if (!parentDoc.exists) return res.json({ success: false, error: 'Parent not found' });
+    const parentData = parentDoc.data();
+    if (!parentData.childrenIds || !parentData.childrenIds.includes(childTgId)) {
+      return res.json({ success: false, error: 'Not authorized' });
+    }
+
+    const childDoc = await db.collection('users').doc(childTgId).get();
+    if (!childDoc.exists) return res.json({ success: false, error: 'Child not found' });
+    const d = childDoc.data();
+
+    res.json({
+      success: true,
+      name: d.name || 'Ребёнок',
+      location: d.location || null,
+      locationUpdatedAt: d.locationUpdatedAt || null,
+      isOnline: d.isOnline || false
+    });
+  } catch(e) {
+    console.error('get-child-location error:', e);
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// Get all children for a parent
+app.post('/get-children', async (req, res) => {
+  try {
+    const { parentTgId } = req.body;
+    if (!parentTgId) return res.json({ success: false, error: 'Missing parentTgId' });
+
+    const parentDoc = await db.collection('users').doc(parentTgId).get();
+    if (!parentDoc.exists) return res.json({ success: true, children: [] });
+    const parentData = parentDoc.data();
+    const childrenIds = parentData.childrenIds || [];
+    if (!childrenIds.length) return res.json({ success: true, children: [] });
+
+    const children = [];
+    for (const childId of childrenIds) {
+      const childDoc = await db.collection('users').doc(childId).get();
+      if (!childDoc.exists) continue;
+      const d = childDoc.data();
+      children.push({
+        tgId: childId,
+        name: d.name || 'Ребёнок',
+        tgUsername: d.tgUsername || null,
+        location: d.location || null,
+        locationUpdatedAt: d.locationUpdatedAt || null,
+        isOnline: d.isOnline || false
+      });
+    }
+
+    res.json({ success: true, children });
+  } catch(e) {
+    console.error('get-children error:', e);
+    res.json({ success: false, error: e.message });
+  }
+});
 
 app.get('/', (req, res) => res.json({ status: 'UserKeeper server running ✅' }));
 
