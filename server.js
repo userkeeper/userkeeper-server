@@ -1,9 +1,10 @@
 const express = require('express');
+const crypto = require('crypto');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // CORS
 app.use((req, res, next) => {
@@ -33,7 +34,7 @@ async function sendMessage(chatId, text) {
   });
 }
 
-// ── WEBHOOK ──────────────────────────────────────────────────────────────────
+// ── WEBHOOK ───────────────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   try {
     const { message } = req.body;
@@ -61,29 +62,29 @@ app.post('/webhook', async (req, res) => {
     // Admin verification commands
     if (username === 'userkeeper') {
       if (text.startsWith('/verify_')) {
-        const userId2 = text.replace('/verify_', '').trim();
-        await db.collection('users').doc(userId2).set({ verificationStatus: 'verified' }, { merge: true });
-        await db.collection('verifications').doc(userId2).set({ verificationStatus: 'verified', verifiedAt: new Date() }, { merge: true });
-        const userDoc = await db.collection('users').doc(userId2).get();
+        const uid = text.replace('/verify_', '').trim();
+        await db.collection('users').doc(uid).set({ verificationStatus: 'verified' }, { merge: true });
+        await db.collection('verifications').doc(uid).set({ verificationStatus: 'verified', verifiedAt: new Date() }, { merge: true });
+        const userDoc = await db.collection('users').doc(uid).get();
         if (userDoc.exists && userDoc.data().chatId) {
           await sendMessage(userDoc.data().chatId,
             `✅ Верификация пройдена!\n\nТвой статус подтверждён. Значок ✅ появится в приложении.\n\nСпасибо что помогаешь людям! 🙏`
           );
         }
-        await sendMessage(chatId, `✅ Пользователь ${userId2} верифицирован`);
+        await sendMessage(chatId, `✅ Пользователь ${uid} верифицирован`);
       }
 
       if (text.startsWith('/reject_')) {
-        const userId2 = text.replace('/reject_', '').trim();
-        await db.collection('users').doc(userId2).set({ verificationStatus: 'rejected' }, { merge: true });
-        await db.collection('verifications').doc(userId2).set({ verificationStatus: 'rejected', rejectedAt: new Date() }, { merge: true });
-        const userDoc = await db.collection('users').doc(userId2).get();
+        const uid = text.replace('/reject_', '').trim();
+        await db.collection('users').doc(uid).set({ verificationStatus: 'rejected' }, { merge: true });
+        await db.collection('verifications').doc(uid).set({ verificationStatus: 'rejected', rejectedAt: new Date() }, { merge: true });
+        const userDoc = await db.collection('users').doc(uid).get();
         if (userDoc.exists && userDoc.data().chatId) {
           await sendMessage(userDoc.data().chatId,
             `❌ Верификация отклонена\n\nК сожалению, документ не прошёл проверку. Если это ошибка — напиши @userkeeper`
           );
         }
-        await sendMessage(chatId, `❌ Пользователь ${userId2} отклонён`);
+        await sendMessage(chatId, `❌ Пользователь ${uid} отклонён`);
       }
     }
 
@@ -193,7 +194,6 @@ app.post('/request-verification', async (req, res) => {
 
     await db.collection('users').doc(tgId).set({ verificationStatus: 'pending' }, { merge: true });
 
-    // Notify admin
     const adminSnap = await db.collection('users').where('tgUsername', '==', 'userkeeper').limit(1).get();
     if (!adminSnap.empty) {
       const adminData = adminSnap.docs[0].data();
@@ -264,6 +264,113 @@ app.post('/get-children', async (req, res) => {
     }
     res.json({ success: true, children });
   } catch(e) { console.error('get-children error:', e); res.json({ success: false, error: e.message }); }
+});
+
+// ── HIKING MODE ───────────────────────────────────────────────────────────────
+app.post('/start-hiking', async (req, res) => {
+  try {
+    const { tgId, name, sessionId, intervalMinutes, startLat, startLng, startedAt } = req.body;
+    if (!tgId || !sessionId) return res.json({ success: false, error: 'Missing fields' });
+
+    const startHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ tgId, sessionId, startLat, startLng, startedAt }))
+      .digest('hex');
+
+    await db.collection('hiking_sessions').doc(sessionId).set({
+      tgId, name, sessionId,
+      intervalMinutes: intervalMinutes || 10,
+      startLat, startLng,
+      startedAt: new Date(startedAt),
+      status: 'active',
+      checkpoints: [],
+      startHash
+    });
+
+    await db.collection('users').doc(tgId).set({
+      isHiking: true,
+      hikingSessionId: sessionId,
+      hikingStartedAt: new Date(startedAt)
+    }, { merge: true });
+
+    console.log('Hiking started:', sessionId);
+    res.json({ success: true, sessionId, startHash });
+  } catch(e) {
+    console.error('Start hiking error:', e);
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/hiking-checkpoint', async (req, res) => {
+  try {
+    const { tgId, sessionId, lat, lng, timestamp } = req.body;
+    if (!tgId || !sessionId) return res.json({ success: false, error: 'Missing fields' });
+
+    const hash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ tgId, sessionId, lat, lng, timestamp }))
+      .digest('hex');
+
+    const checkpoint = { lat, lng, timestamp: new Date(timestamp), hash };
+
+    const admin = require('firebase-admin');
+    await db.collection('hiking_sessions').doc(sessionId).update({
+      checkpoints: admin.firestore.FieldValue.arrayUnion(checkpoint),
+      lastCheckpointAt: new Date(timestamp),
+      lastLat: lat,
+      lastLng: lng
+    });
+
+    await db.collection('users').doc(tgId).set({
+      location: { latitude: lat, longitude: lng },
+      locationUpdatedAt: new Date(),
+      isOnline: true
+    }, { merge: true });
+
+    console.log('Checkpoint saved:', sessionId, lat, lng);
+    res.json({ success: true, hash });
+  } catch(e) {
+    console.error('Checkpoint error:', e);
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/stop-hiking', async (req, res) => {
+  try {
+    const { tgId, sessionId, endLat, endLng, durationMinutes, endedAt } = req.body;
+    if (!tgId || !sessionId) return res.json({ success: false, error: 'Missing fields' });
+
+    const endHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ tgId, sessionId, endLat, endLng, endedAt }))
+      .digest('hex');
+
+    await db.collection('hiking_sessions').doc(sessionId).update({
+      status: 'completed',
+      endLat, endLng,
+      durationMinutes,
+      endedAt: new Date(endedAt),
+      endHash
+    });
+
+    await db.collection('users').doc(tgId).set({
+      isHiking: false,
+      hikingSessionId: null
+    }, { merge: true });
+
+    const userDoc = await db.collection('users').doc(tgId).get();
+    if (userDoc.exists && userDoc.data().chatId) {
+      await sendMessage(userDoc.data().chatId,
+        `🏁 Поход завершён!\n\n⏱ Длительность: ${durationMinutes} мин\n🔐 Маршрут сохранён и захеширован\n\nHash: ${endHash.substring(0, 16)}...`
+      );
+    }
+
+    console.log('Hiking stopped:', sessionId, durationMinutes, 'min');
+    res.json({ success: true, endHash });
+  } catch(e) {
+    console.error('Stop hiking error:', e);
+    res.json({ success: false, error: e.message });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
